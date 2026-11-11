@@ -26,8 +26,8 @@ if echo "# x" | sudo tee -a /etc/hosts >/dev/null 2>&1; then
     echo "   (immutable flag not supported here; relying on the daemon)"
 fi
 step "wiping the block is reverted"
-sudo chattr -i /etc/hosts 2>/dev/null || true
-sudo cp "$BEFORE" /etc/hosts
+sudo sh -c "chattr -i /etc/hosts 2>/dev/null; cp '$BEFORE' /etc/hosts" 2>/dev/null \
+    || echo "   (the daemon locked the file again before it could be overwritten)"
 sleep 4
 grep -q '^0.0.0.0 example.com$' /etc/hosts || fail "daemon did not repair hosts"
 
