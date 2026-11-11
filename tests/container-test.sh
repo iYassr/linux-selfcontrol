@@ -15,7 +15,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     elif command -v apk >/dev/null 2>&1; then
         apk add --no-cache -q python3
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm python >/dev/null
+        pacman -Syu --noconfirm --overwrite "*" python >/dev/null
     elif command -v zypper >/dev/null 2>&1; then
         zypper -q install -y python3 >/dev/null
     fi
@@ -26,6 +26,7 @@ blocked() { python3 -c 'import socket,sys
 a={i[4][0] for i in socket.getaddrinfo(sys.argv[1], 443)}
 sys.exit(0 if a <= {"0.0.0.0", "::"} else 1)' "$1" 2>/dev/null; }
 
+# shellcheck disable=SC1091
 . /etc/os-release
 echo "== $PRETTY_NAME, $(python3 --version)"
 
