@@ -1,0 +1,50 @@
+# title: Adult content
+# description: The most visited adult sites (not exhaustive)
+#
+# One site per line. "www." is added automatically; other subdomains must
+# be listed. Customise with:  selfctl lists edit adult
+
+pornhub.com
+xvideos.com
+xnxx.com
+xhamster.com
+redtube.com
+youporn.com
+tube8.com
+spankbang.com
+eporner.com
+hqporner.com
+tnaflix.com
+porn.com
+youjizz.com
+beeg.com
+xhamsterlive.com
+chaturbate.com
+stripchat.com
+bongacams.com
+cam4.com
+livejasmin.com
+myfreecams.com
+camsoda.com
+onlyfans.com
+fansly.com
+manyvids.com
+rule34.xxx
+e621.net
+nhentai.net
+hanime.tv
+hentaihaven.xxx
+gelbooru.com
+brazzers.com
+bangbros.com
+realitykings.com
+naughtyamerica.com
+motherless.com
+porntrex.com
+txxx.com
+thumbzilla.com
+pornhd.com
+sex.com
+literotica.com
+redgifs.com
+erome.com

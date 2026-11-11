@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 -B -m unittest discover -s tests -v
+
+  lint:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh tests/*.sh
+
+  system:
+    name: Real block on a systemd machine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/system-test.sh
+
+  distros:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:stable-slim
+          - ubuntu:22.04
+          - fedora:latest
+          - archlinux:latest
+          - alpine:latest
+          - opensuse/tumbleweed
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          docker run --rm --cap-add LINUX_IMMUTABLE -v "$PWD":/src:ro
+          ${{ matrix.image }} sh /src/tests/container-test.sh

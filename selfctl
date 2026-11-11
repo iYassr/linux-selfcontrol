@@ -1,0 +1,1758 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""selfctl - Linux SelfControl.
+
+Block distracting websites for a fixed amount of time, system-wide, in a way
+that is deliberately hard to undo. No network access, no accounts, no
+dependencies beyond the Python standard library.
+
+How it works (see README.md for the full picture):
+  * blocked hostnames are pointed at 0.0.0.0 / :: in /etc/hosts
+  * /etc/hosts is marked immutable (chattr +i) while the block is active
+  * a root daemon re-applies everything every 2 seconds if it is tampered with
+  * a systemd timer restarts the daemon if it is killed, and vice versa
+  * the countdown runs on the monotonic boot clock, so changing the system
+    date does not end a block early
+"""
+
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import pwd
+import re
+import select
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+PROJECT_URL = "https://github.com/iYassr/linux-selfcontrol"
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+
+# SELFCTL_ROOT relocates every system path under a directory. It exists for
+# the test-suite; in that mode systemd, DNS cache flushing and browser
+# policies are never touched.
+ROOT = os.environ.get("SELFCTL_ROOT", "").rstrip("/")
+SANDBOX = bool(ROOT)
+
+
+def _p(path):
+    return ROOT + path
+
+
+SELF = os.path.realpath(__file__)
+HOSTS = _p("/etc/hosts")
+STATE_DIR = _p("/var/lib/linux-selfcontrol")
+STATE = STATE_DIR + "/state.json"
+STATE_LOCK = STATE_DIR + "/state.lock"
+DAEMON_LOCK = STATE_DIR + "/daemon.lock"
+HOSTS_BACKUP = STATE_DIR + "/hosts.before-block"
+UNIT_DIR = _p("/etc/systemd/system")
+
+SERVICE = "linux-selfcontrol.service"
+WATCHDOG = "linux-selfcontrol-watchdog.service"
+TIMER = "linux-selfcontrol-watchdog.timer"
+
+MIN_SECONDS = 10
+MAX_SECONDS = 30 * 86400
+MAX_DOMAINS = 100000
+TICK = 2            # seconds between tamper checks
+SAVE_EVERY = 30     # seconds between countdown saves
+SLOW_EVERY = 30     # seconds between unit / browser-policy checks
+
+BEGIN = "# >>> linux-selfcontrol: managed block, edits are reverted >>>"
+END = "# <<< linux-selfcontrol <<<"
+DISABLED = "#selfctl-disabled# "
+
+# Hostnames browsers use to bootstrap DNS-over-HTTPS. Blocking them makes the
+# browser fall back to the system resolver, which honours /etc/hosts.
+DOH_HOSTS = [
+    "dns.google", "dns64.dns.google", "dns.google.com",
+    "cloudflare-dns.com", "one.one.one.one", "1dot1dot1dot1.cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com", "chrome.cloudflare-dns.com",
+    "security.cloudflare-dns.com", "family.cloudflare-dns.com",
+    "dns.quad9.net", "dns9.quad9.net", "dns10.quad9.net", "dns11.quad9.net",
+    "doh.opendns.com", "doh.familyshield.opendns.com",
+    "dns.nextdns.io", "firefox.dns.nextdns.io", "chromium.dns.nextdns.io",
+    "dns.adguard.com", "dns.adguard-dns.com", "unfiltered.adguard-dns.com",
+    "family.adguard-dns.com", "doh.cleanbrowsing.org", "doh.dns.sb",
+    "dns.mullvad.net", "doh.mullvad.net", "base.dns.mullvad.net",
+    "dns.controld.com", "freedns.controld.com", "doh.xfinity.com",
+    "dns.alidns.com", "doh.pub", "dns.sb", "doh.libredns.gr",
+    "dns.digitale-gesellschaft.ch", "doh.applied-privacy.net",
+    "dns.brave.com", "dns.switch.ch", "ordns.he.net", "doh.360.cn",
+    "public.dns.iij.jp", "dns.twnic.tw", "odvr.nic.cz", "wikimedia-dns.org",
+]
+
+# Chromium-family browsers read every JSON file in their managed policy dir.
+CHROMIUM_POLICY_DIRS = {
+    "chromium": "/etc/chromium/policies/managed",
+    "chromium-browser": "/etc/chromium-browser/policies/managed",
+    "google-chrome-stable": "/etc/opt/chrome/policies/managed",
+    "google-chrome": "/etc/opt/chrome/policies/managed",
+    "brave": "/etc/brave/policies/managed",
+    "brave-browser": "/etc/brave/policies/managed",
+    "microsoft-edge-stable": "/etc/opt/edge/policies/managed",
+    "microsoft-edge": "/etc/opt/edge/policies/managed",
+}
+CHROMIUM_POLICY_NAME = "linux-selfcontrol.json"
+CHROMIUM_POLICY = '{\n  "DnsOverHttpsMode": "off"\n}\n'
+FIREFOX_BINARIES = ("firefox", "firefox-esr", "librewolf", "firefox-developer-edition")
+FIREFOX_POLICY_PATH = "/etc/firefox/policies/policies.json"
+FIREFOX_POLICY = (
+    '{\n  "policies": {\n    "DNSOverHTTPS": {\n      "Enabled": false,\n'
+    '      "Locked": true\n    }\n  },\n'
+    '  "_comment": "written by linux-selfcontrol, removed when the block ends"\n}\n'
+)
+
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+def _use_color():
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+
+
+COLOR = _use_color()
+
+
+def c(code, text):
+    return "\x1b[%sm%s\x1b[0m" % (code, text) if COLOR else str(text)
+
+
+def bold(t): return c("1", t)
+def dim(t): return c("2", t)
+def red(t): return c("1;31", t)
+def green(t): return c("32", t)
+def yellow(t): return c("33", t)
+def cyan(t): return c("36", t)
+
+
+def die(message, code=1):
+    sys.stderr.write(red("error: ") + message + "\n")
+    sys.exit(code)
+
+
+def fmt_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append("%dd" % d)
+    if h:
+        parts.append("%dh" % h)
+    if m:
+        parts.append("%dm" % m)
+    if s and not d:
+        parts.append("%ds" % s)
+    return " ".join(parts) or "0s"
+
+
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([dhms]?)")
+
+
+def parse_duration(text):
+    """'90m', '2h', '1h30m', '1d', '45' (minutes), '30s' -> seconds."""
+    s = text.strip().lower().replace(" ", "")
+    if not s:
+        raise ValueError("empty duration")
+    pos, total = 0, 0.0
+    for m in _DURATION_RE.finditer(s):
+        if m.start() != pos:
+            raise ValueError("cannot understand duration %r" % text)
+        pos = m.end()
+        unit = m.group(2) or "m"
+        total += float(m.group(1)) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
+    if pos != len(s):
+        raise ValueError("cannot understand duration %r (try 45m, 2h, 1h30m, 1d)" % text)
+    total = int(round(total))
+    if total < MIN_SECONDS:
+        raise ValueError("duration must be at least %d seconds" % MIN_SECONDS)
+    if total > MAX_SECONDS:
+        raise ValueError("duration cannot exceed %s" % fmt_duration(MAX_SECONDS))
+    return total
+
+
+# --------------------------------------------------------------------------
+# Domains and lists
+# --------------------------------------------------------------------------
+
+_LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+_LISTNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+_RESERVED_SUFFIXES = (".localhost", ".local", ".lan", ".internal", ".localdomain",
+                      ".home.arpa", ".test", ".invalid", ".example")
+ALLOWLIST = "allowlist"
+
+
+def normalize_domain(raw):
+    """Turn user input (domain or URL) into a safe bare hostname.
+
+    Raises ValueError for anything that is not a plain public hostname. This
+    is the only gate between user input and /etc/hosts, so it is strict.
+    """
+    s = raw.strip().lower()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    for sep in "/?#":
+        s = s.split(sep, 1)[0]
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    if s.count(":") == 1:
+        s = s.split(":", 1)[0]
+    if s.startswith("*."):
+        s = s[2:]
+    s = s.strip(".")
+    if not s:
+        raise ValueError("empty hostname")
+    try:
+        s.encode("ascii")
+    except UnicodeError:
+        try:
+            s = s.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("invalid hostname %r" % raw)
+    labels = s.split(".")
+    if len(s) > 253 or len(labels) < 2 or not all(_LABEL_RE.match(x) for x in labels):
+        raise ValueError("invalid hostname %r" % raw)
+    if labels[-1].isdigit():
+        raise ValueError("%r is an IP address, not a hostname" % raw)
+    if s.endswith(_RESERVED_SUFFIXES) or s == socket.gethostname().lower():
+        raise ValueError("refusing to block local name %r" % raw)
+    return s
+
+
+def invoking_home():
+    """Home of the human running the command, even under sudo."""
+    user = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    if user and user != "root":
+        try:
+            return pwd.getpwnam(user).pw_dir
+        except KeyError:
+            pass
+    return os.path.expanduser("~")
+
+
+def config_dir():
+    if os.environ.get("SELFCTL_CONFIG"):
+        return os.environ["SELFCTL_CONFIG"]
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.geteuid() != 0:
+        return os.path.join(xdg, "selfctl")
+    return os.path.join(invoking_home(), ".config", "selfctl")
+
+
+def user_lists_dir():
+    return os.path.join(config_dir(), "lists")
+
+
+def builtin_lists_dir():
+    here = os.path.dirname(SELF)
+    candidates = [
+        os.environ.get("SELFCTL_LISTS", ""),
+        os.path.join(here, "lists"),
+        os.path.join(os.path.dirname(here), "share", "linux-selfcontrol", "lists"),
+        "/usr/share/linux-selfcontrol/lists",
+        "/usr/local/share/linux-selfcontrol/lists",
+    ]
+    for d in candidates:
+        if d and os.path.isdir(d):
+            return d
+    return candidates[1]
+
+
+def _is_ip(token):
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, token)
+            return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def parse_list_file(path):
+    """Return (meta, domains, problems) for one list file."""
+    meta, domains, problems, seen = {}, [], [], set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as e:
+        return meta, domains, ["cannot read %s: %s" % (path, e.strerror)]
+    for no, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            m = re.match(r"#\s*(title|description)\s*:\s*(.+)", stripped, re.I)
+            if m and m.group(1).lower() not in meta:
+                meta[m.group(1).lower()] = m.group(2).strip()
+            continue
+        body = stripped.split("#", 1)[0].split()
+        # accept hosts-file syntax too: "0.0.0.0 example.com"
+        if len(body) >= 2 and _is_ip(body[0]):
+            body = body[1:]
+        for token in body:
+            try:
+                d = normalize_domain(token)
+            except ValueError as e:
+                problems.append("%s:%d: %s" % (os.path.basename(path), no, e))
+                continue
+            if d not in seen:
+                seen.add(d)
+                domains.append(d)
+    return meta, domains, problems
+
+
+def available_lists():
+    """name -> {path, source, title, description, domains, problems}."""
+    found = {}
+    for source, d in (("built-in", builtin_lists_dir()), ("custom", user_lists_dir())):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in names:
+            if not fn.endswith(".txt"):
+                continue
+            name = fn[:-4]
+            if not _LISTNAME_RE.match(name) or name == ALLOWLIST:
+                continue
+            path = os.path.join(d, fn)
+            meta, domains, problems = parse_list_file(path)
+            if source == "custom" and name in found:
+                source_label = "customised"
+            else:
+                source_label = source
+            found[name] = {
+                "name": name, "path": path, "source": source_label,
+                "title": meta.get("title", name.capitalize()),
+                "description": meta.get("description", ""),
+                "domains": domains, "problems": problems,
+            }
+    return found
+
+
+def load_allowlist():
+    path = os.path.join(user_lists_dir(), ALLOWLIST + ".txt")
+    if not os.path.isfile(path):
+        return []
+    return parse_list_file(path)[1]
+
+
+def expand_domains(domains, allow=()):
+    """Add the www. twin of every name and drop anything on the allowlist."""
+    out = set()
+    for d in domains:
+        out.add(d)
+        if not d.startswith("www."):
+            out.add("www." + d)
+    allow = set(allow)
+    if allow:
+        def allowed(name):
+            parts = name.split(".")
+            return any(".".join(parts[i:]) in allow for i in range(len(parts) - 1))
+        out = set(d for d in out if not allowed(d))
+    return sorted(out)
+
+
+def resolve_targets(tokens):
+    """Split CLI tokens into (list names, extra domains, final hostnames)."""
+    lists = available_lists()
+    names, extra, base = [], [], []
+    for tok in tokens:
+        key = tok.strip().lower()
+        if key in lists:
+            names.append(key)
+            base.extend(lists[key]["domains"])
+        elif "." in key:
+            try:
+                d = normalize_domain(key)
+            except ValueError as e:
+                die(str(e))
+            extra.append(d)
+            base.append(d)
+        else:
+            die("unknown list %r. Run 'selfctl lists' to see what is available, "
+                "or pass a domain such as example.com." % tok)
+    return names, extra, expand_domains(base, load_allowlist())
+
+
+# --------------------------------------------------------------------------
+# Low-level system helpers
+# --------------------------------------------------------------------------
+
+_LONG = struct.calcsize("l")
+FS_IOC_GETFLAGS = 0x80086601 if _LONG == 8 else 0x80046601
+FS_IOC_SETFLAGS = 0x40086602 if _LONG == 8 else 0x40046602
+FS_IMMUTABLE_FL = 0x00000010
+
+
+def get_immutable(path):
+    """True / False, or None when the filesystem has no immutable flag."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        buf = bytearray(8)
+        fcntl.ioctl(fd, FS_IOC_GETFLAGS, buf)
+        return bool(struct.unpack("i", bytes(buf[:4]))[0] & FS_IMMUTABLE_FL)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def in_container():
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def set_immutable(path, on):
+    """Set or clear the immutable flag. Returns True when it worked."""
+    if on and in_container():
+        return False      # a locked file would stop the runtime deleting the container
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        buf = bytearray(8)
+        fcntl.ioctl(fd, FS_IOC_GETFLAGS, buf)
+        flags = struct.unpack("i", bytes(buf[:4]))[0]
+        new = flags | FS_IMMUTABLE_FL if on else flags & ~FS_IMMUTABLE_FL
+        if new != flags:
+            fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("i", new) + b"\0" * 4)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, text, mode=0o644):
+    """Replace a file atomically, keeping owner, mode and security labels.
+
+    Falls back to writing in place when the file cannot be renamed over
+    (for example /etc/hosts bind-mounted into a container).
+    """
+    data = text.encode("utf-8", "surrogateescape")
+    directory = os.path.dirname(path)
+    tmp = os.path.join(directory, ".%s.selfctl-tmp" % os.path.basename(path))
+    old = None
+    try:
+        old = os.stat(path)
+    except OSError:
+        pass
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, data)
+            if old is not None:
+                os.fchmod(fd, old.st_mode & 0o7777)
+                try:
+                    os.fchown(fd, old.st_uid, old.st_gid)
+                except OSError:
+                    pass
+                for attr in ("security.selinux",):
+                    try:
+                        os.setxattr(fd, attr, os.getxattr(path, attr))
+                    except (OSError, AttributeError):
+                        pass
+            else:
+                os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        with open(path, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+
+def boottime():
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.monotonic()
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def clock_synced():
+    """True when the kernel says the clock is disciplined by NTP.
+
+    The kernel raises STA_UNSYNC whenever the clock is set by hand, so a
+    manual date change turns this off until a time server corrects it.
+    """
+    if os.environ.get("SELFCTL_CLOCK_SYNCED") is not None and SANDBOX:
+        return os.environ["SELFCTL_CLOCK_SYNCED"] == "1"
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        buf = ctypes.create_string_buffer(512)
+        result = libc.adjtimex(buf)
+        return result not in (-1, 5)   # 5 == TIME_ERROR (unsynchronised)
+    except Exception:
+        return False
+
+
+def run(cmd, timeout=15):
+    """Run a helper command quietly; never raises."""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL, timeout=timeout).returncode
+    except (OSError, subprocess.SubprocessError):
+        return 127
+
+
+def has_systemd():
+    return (not SANDBOX and os.path.isdir("/run/systemd/system")
+            and shutil.which("systemctl") is not None)
+
+
+def flush_dns():
+    if SANDBOX:
+        return
+    if shutil.which("resolvectl"):
+        run(["resolvectl", "flush-caches"], 5)
+    if shutil.which("nscd"):
+        run(["nscd", "-i", "hosts"], 5)
+    if shutil.which("pkill"):
+        run(["pkill", "-HUP", "-x", "dnsmasq"], 5)
+
+
+class locked(object):
+    """Context manager around flock()."""
+
+    def __init__(self, path, blocking=True):
+        self.path, self.blocking, self.fd = path, blocking, None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB))
+        except OSError:
+            os.close(self.fd)
+            self.fd = None
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+        return False
+
+
+# --------------------------------------------------------------------------
+# /etc/hosts
+# --------------------------------------------------------------------------
+
+_MANAGED_LINE_RE = re.compile(r"^(0\.0\.0\.0|::)\s+\S+$")
+
+
+def strip_managed(text):
+    """Remove our block and re-enable lines we commented out."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if line.strip() == BEGIN:
+            inside = True
+            if out and out[-1] == "":
+                out.pop()
+            continue
+        if inside:
+            if line.strip() == END:
+                inside = False
+                continue
+            if _MANAGED_LINE_RE.match(line.strip()) or line.strip().startswith("# selfctl"):
+                continue
+            inside = False           # block was cut short by hand; keep the rest
+        if line.startswith(DISABLED):
+            line = line[len(DISABLED):]
+        out.append(line)
+    return "\n".join(out) + "\n" if out else ""
+
+
+def compose_hosts(text, domains):
+    """Return the hosts file content that enforces `domains`."""
+    blocked = set(domains)
+    lines = []
+    for line in strip_managed(text).splitlines():
+        body = line.split("#", 1)[0].split()
+        # A foreign entry for a blocked name would win over ours; park it.
+        if len(body) >= 2 and any(n.lower() in blocked for n in body[1:]):
+            line = DISABLED + line
+        lines.append(line)
+    while lines and lines[-1] == "":
+        lines.pop()
+    block = [BEGIN, "# selfctl: %d hostnames. Run 'selfctl status' for details." % len(blocked)]
+    for d in sorted(blocked):
+        block.append("0.0.0.0 " + d)
+        block.append(":: " + d)
+    block.append(END)
+    return "\n".join(lines + [""] + block) + "\n"
+
+
+def read_hosts():
+    try:
+        with open(HOSTS, encoding="utf-8", errors="surrogateescape") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def write_hosts(text, immutable):
+    set_immutable(HOSTS, False)
+    atomic_write(HOSTS, text)
+    if immutable:
+        set_immutable(HOSTS, True)
+
+
+def enforce_hosts(domains):
+    """Make /etc/hosts carry the block. Returns True if it had to be fixed."""
+    current = read_hosts()
+    wanted = compose_hosts(current, domains)
+    changed = current != wanted
+    if changed:
+        write_hosts(wanted, True)
+        flush_dns()
+    elif get_immutable(HOSTS) is False:
+        set_immutable(HOSTS, True)
+    return changed
+
+
+# --------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------
+
+def load_state():
+    """Read and validate the block state. None when there is no valid block."""
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        domains = []
+        for d in raw["domains"][:MAX_DOMAINS]:
+            try:
+                domains.append(normalize_domain(str(d)))
+            except ValueError:
+                pass
+        state = {
+            "version": 1,
+            "domains": sorted(set(domains)),
+            "labels": [str(x)[:60] for x in raw.get("labels", [])][:50],
+            "duration": float(raw["duration"]),
+            "remaining": float(raw["remaining"]),
+            "started_wall": float(raw["started_wall"]),
+            "end_wall": float(raw["end_wall"]),
+            "boot_id": str(raw.get("boot_id", "")),
+            "last_boottime": float(raw.get("last_boottime", 0)),
+        }
+        if not state["domains"] or state["duration"] <= 0:
+            return None
+        state["remaining"] = min(state["remaining"], state["duration"], MAX_SECONDS * 2)
+        return state
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    set_immutable(STATE, False)
+    atomic_write(STATE, json.dumps(state, indent=1, sort_keys=True) + "\n")
+    set_immutable(STATE, True)
+
+
+def account(state):
+    """Charge elapsed uptime against the countdown. Returns True when over.
+
+    Time only counts while this boot is running (suspend included). Time
+    spent powered off is credited only through the wall clock, and only when
+    the kernel reports that clock as NTP-synchronised.
+    """
+    now = boottime()
+    current_boot = boot_id()
+    if state.get("boot_id") == current_boot:
+        elapsed = now - state["last_boottime"]
+        if elapsed > 0:
+            state["remaining"] -= elapsed
+    state["boot_id"] = current_boot
+    state["last_boottime"] = now
+    if state["remaining"] <= 0:
+        return True
+    return clock_synced() and time.time() >= state["end_wall"]
+
+
+def remaining_now(state):
+    """Best estimate of the seconds left, without modifying anything."""
+    left = state["remaining"]
+    if state.get("boot_id") == boot_id():
+        left -= max(0, boottime() - state["last_boottime"])
+    if clock_synced():
+        left = min(left, state["end_wall"] - time.time())
+    return max(0, left)
+
+
+# --------------------------------------------------------------------------
+# systemd units and browser policies
+# --------------------------------------------------------------------------
+
+def unit_texts():
+    return {
+        SERVICE: """[Unit]
+Description=Linux SelfControl - enforces the active website block
+Documentation=%(url)s
+ConditionPathExists=/var/lib/linux-selfcontrol/state.json
+RefuseManualStop=yes
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%(self)s _daemon
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+""" % {"url": PROJECT_URL, "self": SELF},
+        WATCHDOG: """[Unit]
+Description=Linux SelfControl - watchdog
+Documentation=%(url)s
+
+[Service]
+Type=oneshot
+ExecStart=%(self)s _watchdog
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+""" % {"url": PROJECT_URL, "self": SELF},
+        TIMER: """[Unit]
+Description=Linux SelfControl - watchdog timer
+Documentation=%(url)s
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=45s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+""" % {"url": PROJECT_URL},
+    }
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except (OSError, UnicodeError):
+        return None
+
+
+def enforce_units():
+    """Keep the service and watchdog installed, unmasked, enabled and running."""
+    if not has_systemd():
+        return
+    reload_needed = False
+    for name, text in unit_texts().items():
+        path = os.path.join(UNIT_DIR, name)
+        dropin = path + ".d"
+        if os.path.isdir(dropin):
+            shutil.rmtree(dropin, ignore_errors=True)
+            reload_needed = True
+        if os.path.islink(path) or _read(path) != text:
+            set_immutable(path, False)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            atomic_write(path, text)
+            reload_needed = True
+        if get_immutable(path) is False:
+            set_immutable(path, True)
+    if reload_needed:
+        run(["systemctl", "daemon-reload"], 30)
+    wants = (("multi-user.target.wants", SERVICE), ("timers.target.wants", TIMER))
+    for directory, name in wants:
+        if not os.path.islink(os.path.join(UNIT_DIR, directory, name)):
+            run(["systemctl", "enable", name])
+    if run(["systemctl", "is-active", "--quiet", TIMER]) != 0:
+        run(["systemctl", "start", TIMER])
+
+
+def remove_units():
+    if not has_systemd():
+        return
+    run(["systemctl", "disable", "--now", TIMER])
+    run(["systemctl", "disable", SERVICE])
+    for name in unit_texts():
+        path = os.path.join(UNIT_DIR, name)
+        set_immutable(path, False)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    run(["systemctl", "daemon-reload"], 30)
+
+
+def enforce_browser_policies():
+    """Switch off DNS-over-HTTPS in installed browsers for the block."""
+    if SANDBOX:
+        return
+    for binary, directory in CHROMIUM_POLICY_DIRS.items():
+        if not shutil.which(binary):
+            continue
+        path = os.path.join(directory, CHROMIUM_POLICY_NAME)
+        if _read(path) != CHROMIUM_POLICY:
+            try:
+                os.makedirs(directory, mode=0o755, exist_ok=True)
+                atomic_write(path, CHROMIUM_POLICY)
+            except OSError:
+                pass
+    if any(shutil.which(b) for b in FIREFOX_BINARIES):
+        # Firefox reads a single policies.json; never touch someone else's.
+        if not os.path.exists(FIREFOX_POLICY_PATH):
+            try:
+                os.makedirs(os.path.dirname(FIREFOX_POLICY_PATH), mode=0o755, exist_ok=True)
+                atomic_write(FIREFOX_POLICY_PATH, FIREFOX_POLICY)
+            except OSError:
+                pass
+
+
+def remove_browser_policies():
+    if SANDBOX:
+        return
+    for directory in set(CHROMIUM_POLICY_DIRS.values()):
+        path = os.path.join(directory, CHROMIUM_POLICY_NAME)
+        if _read(path) == CHROMIUM_POLICY:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    if _read(FIREFOX_POLICY_PATH) == FIREFOX_POLICY:
+        try:
+            os.unlink(FIREFOX_POLICY_PATH)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Block lifecycle (root only)
+# --------------------------------------------------------------------------
+
+def enforce_all(state, slow=True):
+    enforce_hosts(state["domains"])
+    if slow:
+        enforce_units()
+        enforce_browser_policies()
+
+
+def finish():
+    """End the block and put the system back exactly as it was."""
+    current = read_hosts()
+    clean = strip_managed(current)
+    set_immutable(HOSTS, False)
+    if clean != current:
+        write_hosts(clean, False)
+    remove_browser_policies()
+    set_immutable(STATE, False)
+    for path in (STATE, HOSTS_BACKUP):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    flush_dns()
+    remove_units()
+
+
+def self_is_trustworthy():
+    """The daemon runs this file as root at boot: it must be root-owned."""
+    for path in (SELF, os.path.dirname(SELF)):
+        st = os.stat(path)
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            return False
+    return True
+
+
+def spawn_detached_daemon():
+    """Fallback for systems without systemd."""
+    if os.fork():
+        return
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.execv(SELF, [SELF, "_daemon"])
+
+
+def apply_request(req):
+    """Privileged entry point. `req` comes from an unprivileged caller and is
+    validated from scratch. A request can only ever make a block stricter."""
+    if os.geteuid() != 0 and not SANDBOX:
+        die("this step needs root")
+    action = req.get("action")
+    if action not in ("start", "add", "extend"):
+        die("bad request")
+    try:
+        seconds = int(req.get("seconds", 0))
+        domains = sorted(set(normalize_domain(str(d)) for d in req.get("domains", [])))
+    except (ValueError, TypeError) as e:
+        die("bad request: %s" % e)
+    if len(domains) > MAX_DOMAINS:
+        die("too many hostnames (limit %d)" % MAX_DOMAINS)
+    labels = [str(x)[:60] for x in req.get("labels", []) if isinstance(x, str)][:50]
+
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    with locked(STATE_LOCK):
+        state = load_state()
+        if state is not None and account(state):
+            finish()
+            state = None
+
+        if action == "start":
+            if state is not None:
+                die("a block is already active (%s left). Use 'selfctl add' or "
+                    "'selfctl extend' to make it stricter." % fmt_duration(remaining_now(state)))
+            if not domains:
+                die("nothing to block")
+            if not MIN_SECONDS <= seconds <= MAX_SECONDS:
+                die("duration out of range")
+            if has_systemd() and not self_is_trustworthy():
+                die("%s is not installed as a root-owned file.\n"
+                    "Install it first:  sudo ./install.sh" % SELF)
+            if os.path.islink(HOSTS) and not os.access(os.path.realpath(HOSTS), os.W_OK):
+                die("%s is a read-only link on this system; selfctl cannot manage it" % HOSTS)
+            try:
+                shutil.copyfile(HOSTS, HOSTS_BACKUP)
+            except OSError:
+                pass
+            now = time.time()
+            state = {
+                "version": 1,
+                "domains": sorted(set(domains) | set(DOH_HOSTS)),
+                "labels": labels, "duration": float(seconds), "remaining": float(seconds),
+                "started_wall": now, "end_wall": now + seconds,
+                "boot_id": boot_id(), "last_boottime": boottime(),
+            }
+        else:
+            if state is None:
+                die("no block is active. Start one with 'selfctl start'.")
+            if action == "add":
+                if not domains:
+                    die("nothing to add")
+                state["domains"] = sorted(set(state["domains"]) | set(domains))
+                state["labels"] = list(dict.fromkeys(state["labels"] + labels))[:50]
+            else:
+                if seconds < 1:
+                    die("nothing to extend by")
+                if remaining_now(state) + seconds > MAX_SECONDS:
+                    die("a block cannot run longer than %s" % fmt_duration(MAX_SECONDS))
+                state["duration"] += seconds
+                state["remaining"] += seconds
+                state["end_wall"] += seconds
+        save_state(state)
+        enforce_all(state)
+
+    if has_systemd():
+        if run(["systemctl", "start", SERVICE]) != 0:
+            sys.stderr.write(yellow("warning: ") + "could not start %s; the watchdog "
+                             "timer will retry.\n" % SERVICE)
+    elif not SANDBOX:
+        spawn_detached_daemon()
+    return state
+
+
+def cmd_daemon():
+    if os.geteuid() != 0 and not SANDBOX:
+        die("the daemon must run as root")
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    guard = locked(DAEMON_LOCK, blocking=False)
+    try:
+        guard.__enter__()
+    except OSError:
+        return 0                      # another daemon is already on duty
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    with locked(STATE_LOCK):
+        mem = load_state()
+    if mem is None:
+        with locked(STATE_LOCK):
+            finish()
+        return 0
+
+    last_save = last_slow = 0.0
+    last_raw = _read(STATE)
+    while True:
+        with locked(STATE_LOCK):
+            raw = _read(STATE)
+            dirty = raw != last_raw                     # edited, deleted or extended
+            disk = load_state() if dirty else None
+            if disk is not None:
+                # The file on disk is how 'add' and 'extend' reach us. Only
+                # ever accept changes that make the block stricter.
+                merged = sorted(set(mem["domains"]) | set(disk["domains"]))
+                if merged != mem["domains"]:
+                    mem["domains"] = merged
+                    mem["labels"] = list(dict.fromkeys(mem["labels"] + disk["labels"]))[:50]
+                extra = disk["duration"] - mem["duration"]
+                if extra > 0:
+                    mem["duration"] += extra
+                    mem["remaining"] += extra
+                    mem["end_wall"] += extra
+            over = account(mem)
+            now = boottime()
+            if over:
+                finish()
+                return 0
+            if stopping:
+                save_state(mem)
+                return 1              # non-zero so systemd restarts us
+            slow = now - last_slow >= SLOW_EVERY
+            try:
+                enforce_all(mem, slow)
+                if dirty or now - last_save >= SAVE_EVERY:
+                    save_state(mem)
+                    last_save, last_raw = now, _read(STATE)
+            except OSError as e:
+                sys.stderr.write("selfctl: enforcement problem: %s\n" % e)
+            if slow:
+                last_slow = now
+        time.sleep(TICK if not SANDBOX else float(os.environ.get("SELFCTL_TICK", "0.1")))
+
+
+def cmd_watchdog():
+    """Runs from the timer. Revives the daemon, or enforces in its place."""
+    if os.geteuid() != 0 and not SANDBOX:
+        die("the watchdog must run as root")
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    try:
+        with locked(DAEMON_LOCK, blocking=False):
+            with locked(STATE_LOCK):
+                state = load_state()
+                if state is None or account(state):
+                    finish()
+                    return 0
+                enforce_all(state)
+                save_state(state)
+    except OSError as e:
+        if e.errno not in (errno.EAGAIN, errno.EACCES):
+            raise
+        return 0                      # daemon holds the lock: all is well
+    if has_systemd():
+        run(["systemctl", "start", SERVICE])
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Talking to the privileged side
+# --------------------------------------------------------------------------
+
+def elevate(request):
+    """Run apply_request as root, asking for a password if needed."""
+    if os.geteuid() == 0 or SANDBOX:
+        return apply_request(request) and 0
+    payload = json.dumps(request)
+    if shutil.which("sudo") and (sys.stdin.isatty() or run(["sudo", "-n", "true"]) == 0):
+        prefix = ["sudo", "--"]
+    elif shutil.which("pkexec"):
+        prefix = ["pkexec"]
+    elif shutil.which("sudo"):
+        prefix = ["sudo", "--"]
+    elif shutil.which("doas"):
+        prefix = ["doas"]
+    else:
+        die("need root: run this command with sudo")
+    try:
+        proc = subprocess.run(prefix + [SELF, "_apply"], input=payload.encode())
+    except KeyboardInterrupt:
+        die("cancelled")
+    return proc.returncode
+
+
+# --------------------------------------------------------------------------
+# Status
+# --------------------------------------------------------------------------
+
+def protection_report(state):
+    """What is actually guarding the block right now."""
+    hosts_ok = compose_hosts(read_hosts(), state["domains"]) == read_hosts()
+    report = [("hosts file", hosts_ok), ("locked", bool(get_immutable(HOSTS)))]
+    if has_systemd():
+        report.append(("daemon", run(["systemctl", "is-active", "--quiet", SERVICE]) == 0))
+        report.append(("watchdog", run(["systemctl", "is-active", "--quiet", TIMER]) == 0))
+    return report
+
+
+def progress_bar(fraction, width=30):
+    filled = int(round(max(0.0, min(1.0, fraction)) * width))
+    return c("36", "█" * filled) + dim("░" * (width - filled))
+
+
+def visible_count(state):
+    """Hostnames the user asked for (the DoH helper entries are not counted)."""
+    return len(set(state["domains"]) - set(DOH_HOSTS)) or len(state["domains"])
+
+
+def status_lines(state, report=None):
+    if state is None:
+        return [
+            "",
+            "  " + green("○") + bold(" No block is active"),
+            "",
+            "  " + dim("Start one:  ") + "selfctl start 1h social",
+            "  " + dim("Or just run ") + "selfctl" + dim(" for the guided menu."),
+            "",
+        ]
+    left = remaining_now(state)
+    done = 1 - left / state["duration"] if state["duration"] else 1
+    ends = time.strftime("%a %H:%M", time.localtime(time.time() + left))
+    labels = ", ".join(state["labels"]) or "custom sites"
+    lines = [
+        "",
+        "  " + red("●") + bold(" Block is ACTIVE"),
+        "",
+        "  " + bold(fmt_duration(left)) + " remaining" + dim("   ends ≈ " + ends),
+        "  " + progress_bar(done) + dim("  %d%%" % int(done * 100)),
+        "",
+        "  " + dim("blocking  ") + "%d hostnames" % visible_count(state),
+        "  " + dim("lists     ") + labels,
+    ]
+    if report:
+        marks = "  ".join((green("✔ ") if ok else red("✘ ")) + name for name, ok in report)
+        lines.append("  " + dim("guards    ") + marks)
+    lines.append("")
+    return lines
+
+
+def cmd_status(args):
+    state = load_state()
+    if "--json" in args:
+        out = {"active": state is not None, "version": VERSION}
+        if state:
+            left = remaining_now(state)
+            out.update(remaining_seconds=int(left), duration_seconds=int(state["duration"]),
+                       ends_at=int(time.time() + left), hostnames=visible_count(state),
+                       lists=state["labels"])
+        print(json.dumps(out))
+    elif "--short" in args:
+        # for status bars: empty when idle
+        if state:
+            print("🔒 " + fmt_duration(remaining_now(state)))
+    else:
+        print("\n".join(status_lines(state, protection_report(state) if state else None)))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Interactive menu
+# --------------------------------------------------------------------------
+
+class RawTerminal(object):
+    def __enter__(self):
+        import termios
+        import tty
+        self.termios = termios
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        sys.stdout.write("\x1b[?25l")
+        return self
+
+    def __exit__(self, *exc):
+        self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.saved)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+        return False
+
+    def key(self, timeout=None):
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return None
+        data = os.read(self.fd, 16)
+        return {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1bOA": "up", b"\x1bOB": "down",
+                b"\r": "enter", b"\n": "enter", b" ": "space", b"\x1b": "esc",
+                b"\x03": "quit", b"\x04": "quit", b"k": "up", b"j": "down",
+                b"q": "quit"}.get(data, data.decode("utf-8", "ignore"))
+
+
+class Screen(object):
+    """Redraws a block of lines in place."""
+
+    def __init__(self):
+        self.height = 0
+
+    def draw(self, lines):
+        out = ""
+        if self.height:
+            out += "\x1b[%dA" % self.height
+        out += "\r\x1b[J" + "\n".join(lines) + "\n"
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        self.height = len(lines)
+
+
+def banner():
+    return ["", "  " + bold(c("1;36", "Linux SelfControl")) + dim("  v" + VERSION), ""]
+
+
+def checklist_frame(title, items, cursor, chosen, hint):
+    lines = banner() + ["  " + bold(title), ""]
+    for i, (key, label, note) in enumerate(items):
+        pointer = cyan("❯") if i == cursor else " "
+        box = green("[✔]") if key in chosen else dim("[ ]")
+        text = "%-22s" % label
+        lines.append("  %s %s %s %s" % (pointer, box, bold(text) if i == cursor else text, dim(note)))
+    lines += ["", "  " + dim(hint), ""]
+    return lines
+
+
+def choice_frame(title, options, cursor, hint):
+    lines = banner() + ["  " + bold(title), ""]
+    for i, (_, label) in enumerate(options):
+        pointer = cyan("❯") if i == cursor else " "
+        lines.append("  %s %s" % (pointer, bold(label) if i == cursor else label))
+    lines += ["", "  " + dim(hint), ""]
+    return lines
+
+
+def pick_many(title, items, chosen):
+    cursor, chosen, screen = 0, set(chosen), Screen()
+    hint = "↑/↓ move   space select   a all   enter continue   q quit"
+    with RawTerminal() as term:
+        while True:
+            screen.draw(checklist_frame(title, items, cursor, chosen, hint))
+            key = term.key()
+            if key == "up":
+                cursor = (cursor - 1) % len(items)
+            elif key == "down":
+                cursor = (cursor + 1) % len(items)
+            elif key == "space":
+                chosen ^= {items[cursor][0]}
+            elif key == "a":
+                keys = set(k for k, _, _ in items)
+                chosen = set() if chosen == keys else keys
+            elif key == "enter":
+                return [k for k, _, _ in items if k in chosen]
+            elif key in ("quit", "esc"):
+                return None
+
+
+def pick_one(title, options, cursor=0):
+    screen = Screen()
+    hint = "↑/↓ move   enter select   q quit"
+    with RawTerminal() as term:
+        while True:
+            screen.draw(choice_frame(title, options, cursor, hint))
+            key = term.key()
+            if key == "up":
+                cursor = (cursor - 1) % len(options)
+            elif key == "down":
+                cursor = (cursor + 1) % len(options)
+            elif key == "enter":
+                return options[cursor][0]
+            elif key in ("quit", "esc"):
+                return None
+
+
+def ask(prompt):
+    try:
+        return input("  " + prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def confirm_lines(names, extra, hostnames, seconds):
+    what = ", ".join(names + extra) or "custom sites"
+    ends = time.strftime("%a %H:%M", time.localtime(time.time() + seconds))
+    return [
+        "",
+        "  " + bold("About to block"),
+        "",
+        "  " + dim("what      ") + what,
+        "  " + dim("hostnames ") + str(len(hostnames)),
+        "  " + dim("for       ") + bold(fmt_duration(seconds)) + dim("   until ≈ " + ends),
+        "",
+        "  " + yellow("There is no stop button.") + " Once it starts you cannot cancel it,",
+        "  shorten it, or remove a site until the time is up.",
+        "",
+    ]
+
+
+def _last_path():
+    return os.path.join(config_dir(), "last.json")
+
+
+def load_last():
+    try:
+        with open(_last_path()) as fh:
+            data = json.load(fh)
+        return [str(x) for x in data.get("lists", [])], str(data.get("duration", "1h"))
+    except (OSError, ValueError, AttributeError):
+        return ["social"], "1h"
+
+
+def save_last(names, duration_text):
+    if os.geteuid() == 0:
+        return
+    try:
+        os.makedirs(config_dir(), exist_ok=True)
+        with open(_last_path(), "w") as fh:
+            json.dump({"lists": names, "duration": duration_text}, fh)
+    except OSError:
+        pass
+
+
+DURATION_CHOICES = [("25m", "25 minutes"), ("50m", "50 minutes"), ("1h", "1 hour"),
+                    ("2h", "2 hours"), ("4h", "4 hours"), ("8h", "8 hours"),
+                    ("1d", "24 hours"), ("custom", "Custom…")]
+
+
+def interactive_start():
+    lists = available_lists()
+    last_names, last_duration = load_last()
+    items = [(n, lists[n]["title"], "%d sites" % len(lists[n]["domains"])) for n in sorted(lists)]
+    items.append(("+custom", "Other sites…", "type your own"))
+    picked = pick_many("What do you want to block?", items,
+                       [n for n in last_names if n in lists])
+    if picked is None:
+        return 0
+    tokens = [p for p in picked if p != "+custom"]
+    if "+custom" in picked:
+        typed = ask("Sites to block (space separated): ")
+        tokens += typed.replace(",", " ").split()
+    if not tokens:
+        print("  Nothing selected.")
+        return 0
+    keys = [k for k, _ in DURATION_CHOICES]
+    start_at = keys.index(last_duration) if last_duration in keys else 2
+    duration_text = pick_one("For how long?", DURATION_CHOICES, start_at)
+    if duration_text is None:
+        return 0
+    if duration_text == "custom":
+        duration_text = ask("Duration (e.g. 45m, 3h, 1h30m, 2d): ")
+    return start_block(duration_text, tokens, assume_yes=False)
+
+
+def interactive_active(state):
+    screen = Screen()
+    hint = "a add sites   e extend   q quit"
+    report, checked = protection_report(state), time.time()
+    with RawTerminal() as term:
+        while True:
+            state = load_state()
+            if state is None or remaining_now(state) <= 0:
+                screen.draw(banner() + ["  " + green("✔ ") + bold("Block finished. Welcome back."), ""])
+                return 0
+            if time.time() - checked > 10:
+                report, checked = protection_report(state), time.time()
+            screen.draw(banner()[:-1] + status_lines(state, report) + ["  " + dim(hint), ""])
+            key = term.key(1)
+            if key in ("quit", "esc"):
+                return 0
+            if key in ("a", "e"):
+                break
+    if key == "a":
+        typed = ask("Lists or sites to add: ")
+        return cmd_add(typed.replace(",", " ").split()) if typed else 0
+    typed = ask("Extend by (e.g. 30m, 1h): ")
+    return cmd_extend([typed]) if typed else 0
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def start_block(duration_text, tokens, assume_yes):
+    try:
+        seconds = parse_duration(duration_text)
+    except ValueError as e:
+        die(str(e))
+    names, extra, hostnames = resolve_targets(tokens)
+    if not hostnames:
+        die("nothing to block (everything selected is on your allowlist?)")
+    state = load_state()
+    if state is not None and remaining_now(state) > 0:
+        die("a block is already active (%s left). Use 'selfctl add' or 'selfctl extend'."
+            % fmt_duration(remaining_now(state)))
+    if not assume_yes:
+        print("\n".join(confirm_lines(names, extra, hostnames, seconds)))
+        if not sys.stdin.isatty():
+            die("refusing to start without confirmation; pass --yes")
+        if ask("Start the block? [y/N] ").lower() not in ("y", "yes"):
+            print("  Cancelled. Nothing was changed.")
+            return 1
+    labels = names + (["%d custom" % len(extra)] if extra else [])
+    code = elevate({"action": "start", "seconds": seconds, "domains": hostnames,
+                    "labels": labels})
+    if code == 0:
+        save_last(names, duration_text)
+        cmd_status([])
+        print("  " + dim("Tip: restart your browser so it drops cached connections."))
+        print()
+    return code
+
+
+def cmd_start(args):
+    assume_yes = False
+    rest = []
+    for a in args:
+        if a in ("-y", "--yes"):
+            assume_yes = True
+        elif a.startswith("-"):
+            die("unknown option %s" % a)
+        else:
+            rest.append(a)
+    if not rest:
+        die("usage: selfctl start <duration> [list|domain ...]\n"
+            "       e.g. selfctl start 2h social video reddit.com")
+    tokens = rest[1:] or load_last()[0]
+    return start_block(rest[0], tokens, assume_yes)
+
+
+def cmd_add(args):
+    if not args:
+        die("usage: selfctl add <list|domain> ...")
+    if load_state() is None:
+        die("no block is active. Start one with 'selfctl start'.")
+    names, extra, hostnames = resolve_targets(args)
+    labels = names + (["%d custom" % len(extra)] if extra else [])
+    code = elevate({"action": "add", "domains": hostnames, "labels": labels})
+    if code == 0:
+        print("  " + green("✔") + " Added %d hostnames to the active block." % len(hostnames))
+    return code
+
+
+def cmd_extend(args):
+    if len(args) != 1:
+        die("usage: selfctl extend <duration>   e.g. selfctl extend 30m")
+    if load_state() is None:
+        die("no block is active. Start one with 'selfctl start'.")
+    try:
+        seconds = parse_duration(args[0])
+    except ValueError as e:
+        die(str(e))
+    code = elevate({"action": "extend", "seconds": seconds})
+    if code == 0:
+        state = load_state()
+        print("  " + green("✔") + " Extended by %s. %s left." % (
+            fmt_duration(seconds), fmt_duration(remaining_now(state) if state else 0)))
+    return code
+
+
+LIST_TEMPLATE = """# title: %s
+# description: My own list
+#
+# One site per line. Lines starting with # are ignored.
+# "www." is added automatically; other subdomains must be listed.
+
+"""
+
+ALLOW_TEMPLATE = """# Sites listed here are never blocked, even if a list contains them.
+# One site per line. A site also covers its subdomains.
+
+"""
+
+
+def open_editor(path):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    for candidate in ([editor] if editor else []) + ["nano", "vim", "vi"]:
+        argv = candidate.split()
+        if argv and shutil.which(argv[0]):
+            return subprocess.call(argv + [path])
+    print("  No editor found. Edit this file by hand:\n  " + path)
+    return 0
+
+
+def cmd_lists(args):
+    lists = available_lists()
+    sub = args[0] if args else "show-all"
+    name = args[1].lower() if len(args) > 1 else None
+
+    if sub == "show-all":
+        print()
+        print("  " + bold("%-11s %-26s %6s  %s" % ("LIST", "WHAT", "SITES", "SOURCE")))
+        for n in sorted(lists):
+            item = lists[n]
+            print("  %s %-26s %6d  %s" % (cyan("%-11s" % n), item["title"][:26],
+                                          len(item["domains"]), dim(item["source"])))
+        allow = load_allowlist()
+        print()
+        if allow:
+            print("  " + dim("allowlist: %d sites are never blocked" % len(allow)))
+        print("  " + dim("selfctl lists show NAME · edit NAME · new NAME · reset NAME · edit allowlist"))
+        print()
+        return 0
+
+    if sub in ("show", "edit", "new", "reset", "rm", "remove") and not name:
+        die("usage: selfctl lists %s NAME" % sub)
+
+    if sub == "show":
+        if name == ALLOWLIST:
+            print("\n".join(load_allowlist()))
+            return 0
+        if name not in lists:
+            die("no list called %r" % name)
+        for problem in lists[name]["problems"]:
+            sys.stderr.write(yellow("warning: ") + problem + "\n")
+        print("\n".join(lists[name]["domains"]))
+        return 0
+
+    if sub in ("edit", "new"):
+        if os.geteuid() == 0 and not os.environ.get("SUDO_USER"):
+            die("edit lists as your normal user, not as root")
+        if not _LISTNAME_RE.match(name):
+            die("list names use lowercase letters, digits, - and _")
+        if sub == "new" and name in lists:
+            die("a list called %r already exists; use 'selfctl lists edit %s'" % (name, name))
+        if sub == "edit" and name not in lists and name != ALLOWLIST:
+            die("no list called %r; create it with 'selfctl lists new %s'" % (name, name))
+        os.makedirs(user_lists_dir(), exist_ok=True)
+        target = os.path.join(user_lists_dir(), name + ".txt")
+        if not os.path.exists(target):
+            if name == ALLOWLIST:
+                content = ALLOW_TEMPLATE
+            elif name in lists:
+                with open(lists[name]["path"], encoding="utf-8") as fh:
+                    content = fh.read()
+            else:
+                content = LIST_TEMPLATE % name.capitalize()
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        code = open_editor(target)
+        _, domains, problems = parse_list_file(target)
+        for problem in problems:
+            sys.stderr.write(yellow("warning: ") + problem + "\n")
+        print("  " + green("✔") + " %s: %d sites  " % (name, len(domains)) + dim(target))
+        if load_state() is not None:
+            print("  " + dim("The running block is unchanged; use 'selfctl add %s' to add "
+                             "new sites to it." % name))
+        return code
+
+    if sub in ("reset", "rm", "remove"):
+        target = os.path.join(user_lists_dir(), name + ".txt")
+        if not os.path.exists(target):
+            die("%r has no custom version to remove" % name)
+        os.unlink(target)
+        print("  " + green("✔") + " Removed your version of %r." % name)
+        return 0
+
+    die("unknown lists command %r (try: show, edit, new, reset)" % sub)
+
+
+BLOCKED_ADDRESSES = ("0.0.0.0", "::", "127.0.0.1", "::1")
+
+
+def lookup(host):
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError):
+        return []
+    return sorted(set(i[4][0] for i in infos))
+
+
+def cmd_check(args):
+    if not args:
+        die("usage: selfctl check <domain> ...")
+    worst = 0
+    state = load_state()
+    mine = set(state["domains"]) if state else set()
+    print()
+    for raw in args:
+        try:
+            host = normalize_domain(raw)
+        except ValueError as e:
+            die(str(e))
+        addrs = lookup(host)
+        if addrs and all(a in BLOCKED_ADDRESSES for a in addrs):
+            note = "" if host in mine else dim("  (not by selfctl: your DNS or another tool)")
+            print("  " + red("● blocked ") + " " + host + note)
+        elif addrs:
+            print("  " + green("○ reachable") + " " + host + dim("  → " + ", ".join(addrs[:3])))
+            worst = 1
+        else:
+            print("  " + yellow("? no answer") + " " + host + dim("  (offline, or it does not exist)"))
+    print()
+    return worst
+
+
+def cmd_doctor(_args):
+    ok_all = [True]
+
+    def row(ok, label, detail=""):
+        mark = green("✔") if ok is True else (red("✘") if ok is False else yellow("!"))
+        if ok is False:
+            ok_all[0] = False
+        print("  %s %-34s %s" % (mark, label, dim(detail)))
+
+    print()
+    print("  " + bold("selfctl doctor") + dim("  v" + VERSION))
+    print()
+    row(sys.version_info >= (3, 6), "Python %d.%d" % sys.version_info[:2])
+    if has_systemd():
+        row(True, "systemd found", "daemon and watchdog available")
+    else:
+        row(None, "no systemd", "blocks work, but do not resume after a reboot")
+    try:
+        trusted = self_is_trustworthy()
+    except OSError:
+        trusted = False
+    row(trusted if has_systemd() else True, "installed as root-owned file", SELF)
+    real = os.path.realpath(HOSTS)
+    row(os.path.isfile(real), "hosts file", real + (" (via symlink)" if real != HOSTS else ""))
+    try:
+        nss = _p("/etc/nsswitch.conf")
+        with open(nss if os.path.exists(nss) else _p("/usr/etc/nsswitch.conf")) as fh:
+            line = [x for x in fh.read().splitlines() if x.strip().startswith("hosts:")]
+        uses = bool(line) and bool(re.search(r"\b(files|resolve)\b", line[0]))
+        row(uses, "resolver reads /etc/hosts", line[0].strip() if line else "no hosts: line")
+    except OSError:
+        row(None, "resolver reads /etc/hosts", "no nsswitch.conf (musl?) - hosts is used by default")
+    if os.geteuid() == 0:
+        probe = os.path.join(os.path.dirname(real), ".selfctl-probe")
+        try:
+            with open(probe, "w") as fh:
+                fh.write("x")
+            locked_ok = set_immutable(probe, True) and get_immutable(probe)
+            set_immutable(probe, False)
+            os.unlink(probe)
+            if locked_ok:
+                row(True, "immutable flag supported", "hosts file can be locked")
+            else:
+                row(None, "immutable flag not supported", "daemon still reverts edits within 2s")
+        except OSError as e:
+            row(False, "can write next to hosts file", e.strerror)
+    else:
+        row(None, "immutable flag", "run 'sudo selfctl doctor' to test")
+    row(True if clock_synced() else None, "clock synchronised (NTP)",
+        "" if clock_synced() else "time spent powered off will not count down")
+    lists = available_lists()
+    row(bool(lists), "block lists", "%d lists in %s" % (len(lists), builtin_lists_dir()))
+    browsers = [b for b in list(CHROMIUM_POLICY_DIRS) + list(FIREFOX_BINARIES) if shutil.which(b)]
+    row(True, "browsers", ", ".join(browsers) + " (encrypted DNS is turned off during a block)"
+        if browsers else "none of the known ones found")
+    state = load_state()
+    if state:
+        sample = [d for d in state["domains"] if d not in DOH_HOSTS][:1] or state["domains"][:1]
+        addrs = lookup(sample[0])
+        row(bool(addrs) and all(a in BLOCKED_ADDRESSES for a in addrs),
+            "active block resolves as blocked", "%s → %s" % (sample[0], ", ".join(addrs) or "nothing"))
+    print()
+    return 0 if ok_all[0] else 1
+
+
+HELP = """%(title)s  v%(version)s
+Block distracting websites for a set time. There is no stop button.
+
+%(usage)s
+  selfctl                          guided menu
+  selfctl start <time> [what...]   start a block
+  selfctl status                   time left and what is blocked
+  selfctl add <what...>            block more sites during a block
+  selfctl extend <time>            make a running block longer
+  selfctl lists                    show the ready-made and custom lists
+  selfctl lists edit <name>        customise a list (or 'allowlist')
+  selfctl lists new <name>         create your own list
+  selfctl check <domain...>        is this site blocked right now?
+  selfctl doctor                   check that this system is supported
+
+%(examples)s
+  selfctl start 2h social video
+  selfctl start 45m reddit.com news.ycombinator.com
+  selfctl start 1h30m social -y    skip the confirmation question
+
+  <time> is like 25m, 2h, 1h30m or 1d.  <what> is a list name or a domain.
+  status also takes --json and --short (for status bars).
+
+%(url)s
+"""
+
+
+def cmd_help():
+    print(HELP % {"title": bold("Linux SelfControl"), "version": VERSION,
+                  "usage": bold("Usage"), "examples": bold("Examples"),
+                  "url": dim(PROJECT_URL)})
+    return 0
+
+
+def main(argv):
+    if not argv:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return cmd_help()
+        state = load_state()
+        if state is not None and remaining_now(state) > 0:
+            return interactive_active(state)
+        return interactive_start()
+    cmd, args = argv[0], argv[1:]
+    if cmd in ("-h", "--help", "help"):
+        return cmd_help()
+    if cmd in ("-V", "--version", "version"):
+        print("selfctl " + VERSION)
+        return 0
+    if cmd == "_apply":
+        try:
+            request = json.loads(sys.stdin.read(8 * 1024 * 1024))
+        except ValueError:
+            die("bad request")
+        if not isinstance(request, dict):
+            die("bad request")
+        apply_request(request)
+        return 0
+    if cmd == "_daemon":
+        return cmd_daemon()
+    if cmd == "_watchdog":
+        return cmd_watchdog()
+    commands = {"start": cmd_start, "status": cmd_status, "add": cmd_add,
+                "extend": cmd_extend, "lists": cmd_lists, "list": cmd_lists,
+                "check": cmd_check, "doctor": cmd_doctor}
+    if cmd in ("stop", "cancel", "unblock", "remove", "off"):
+        die("there is no way to stop a block early. That is the point.\n"
+            "       'selfctl status' shows how long is left.")
+    if cmd not in commands:
+        die("unknown command %r. Run 'selfctl help'." % cmd)
+    return commands[cmd](args) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)

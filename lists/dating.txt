@@ -1,0 +1,22 @@
+# title: Dating
+# description: Dating apps and sites
+#
+# One site per line. "www." is added automatically; other subdomains must
+# be listed. Customise with:  selfctl lists edit dating
+
+tinder.com
+bumble.com
+hinge.co
+okcupid.com
+match.com
+pof.com
+eharmony.com
+badoo.com
+grindr.com
+web.grindr.com
+feeld.co
+happn.com
+zoosk.com
+coffeemeetsbagel.com
+muzz.com
+tantanapp.com

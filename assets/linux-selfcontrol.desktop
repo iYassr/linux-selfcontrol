@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Linux SelfControl
+GenericName=Website Blocker
+Comment=Block distracting websites for a set time
+Exec=selfctl
+Icon=linux-selfcontrol
+Terminal=true
+Categories=Utility;Network;
+Keywords=focus;block;distraction;selfcontrol;productivity;

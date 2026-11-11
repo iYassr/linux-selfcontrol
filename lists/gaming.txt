@@ -1,0 +1,55 @@
+# title: Games
+# description: Game stores, launchers and browser games
+#
+# One site per line. "www." is added automatically; other subdomains must
+# be listed. Customise with:  selfctl lists edit gaming
+
+store.steampowered.com
+steamcommunity.com
+steampowered.com
+epicgames.com
+store.epicgames.com
+roblox.com
+web.roblox.com
+minecraft.net
+ea.com
+origin.com
+ubisoft.com
+store.ubi.com
+battle.net
+blizzard.com
+riotgames.com
+leagueoflegends.com
+playvalorant.com
+op.gg
+xbox.com
+playstation.com
+store.playstation.com
+nintendo.com
+gog.com
+itch.io
+humblebundle.com
+chess.com
+lichess.org
+poki.com
+crazygames.com
+miniclip.com
+kongregate.com
+newgrounds.com
+armorgames.com
+coolmathgames.com
+y8.com
+ign.com
+gamespot.com
+kotaku.com
+polygon.com
+pcgamer.com
+eurogamer.net
+geoguessr.com
+agar.io
+slither.io
+krunker.io
+wordleunlimited.org
+fortnite.com
+fortnitetracker.com
+tracker.gg

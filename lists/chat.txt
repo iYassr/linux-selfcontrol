@@ -1,0 +1,25 @@
+# title: Chat and messaging
+# description: Web messengers and community chat
+#
+# One site per line. "www." is added automatically; other subdomains must
+# be listed. Customise with:  selfctl lists edit chat
+
+web.whatsapp.com
+whatsapp.com
+web.telegram.org
+telegram.org
+t.me
+telegram.me
+discord.com
+discordapp.com
+discord.gg
+canary.discord.com
+ptb.discord.com
+gateway.discord.gg
+messenger.com
+web.skype.com
+skype.com
+wechat.com
+web.wechat.com
+line.me
+viber.com

@@ -1,0 +1,47 @@
+# title: Gambling
+# description: Betting, casinos and prediction markets
+#
+# One site per line. "www." is added automatically; other subdomains must
+# be listed. Customise with:  selfctl lists edit gambling
+
+bet365.com
+betway.com
+888.com
+888casino.com
+888sport.com
+williamhill.com
+ladbrokes.com
+coral.co.uk
+paddypower.com
+betfair.com
+skybet.com
+unibet.com
+bwin.com
+betfred.com
+draftkings.com
+sportsbook.draftkings.com
+fanduel.com
+sportsbook.fanduel.com
+betmgm.com
+caesars.com
+espnbet.com
+pokerstars.com
+partypoker.com
+ggpoker.com
+stake.com
+stake.us
+roobet.com
+rollbit.com
+bc.game
+1xbet.com
+22bet.com
+melbet.com
+bovada.lv
+betonline.ag
+mybookie.ag
+polymarket.com
+kalshi.com
+predictit.org
+prizepicks.com
+underdogfantasy.com
+csgoempire.com

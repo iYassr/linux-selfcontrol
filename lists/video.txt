@@ -1,0 +1,55 @@
+# title: Video and streaming
+# description: Video sites, streaming and live streams
+#
+# One site per line. "www." is added automatically; other subdomains must
+# be listed. Customise with:  selfctl lists edit video
+
+youtube.com
+m.youtube.com
+music.youtube.com
+youtu.be
+youtube-nocookie.com
+youtubei.googleapis.com
+tv.youtube.com
+studio.youtube.com
+youtubekids.com
+netflix.com
+twitch.tv
+m.twitch.tv
+clips.twitch.tv
+kick.com
+primevideo.com
+disneyplus.com
+hulu.com
+max.com
+hbomax.com
+play.max.com
+paramountplus.com
+peacocktv.com
+tv.apple.com
+crunchyroll.com
+vimeo.com
+dailymotion.com
+rumble.com
+bitchute.com
+odysee.com
+bilibili.com
+m.bilibili.com
+shahid.mbc.net
+shahid.net
+osn.com
+osnplus.com
+starzplay.com
+tod.tv
+watchit.com
+viu.com
+iq.com
+wetv.vip
+pluto.tv
+tubitv.com
+plex.tv
+app.plex.tv
+curiositystream.com
+nebula.tv
+dazn.com
+espn.com
